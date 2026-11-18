@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+*.spec
+.venv/
+venv/
+env/
+
+# ---- 运行产物 / 本地数据（不要上传）----
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+*.bak
+*.tmp
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+.trae/
