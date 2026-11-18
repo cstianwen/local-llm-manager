@@ -2,23 +2,23 @@
 
 一个运行在 Windows 上的本地大模型管理工具：扫描本机已有模型、查看运行状态、识别正在调用模型的应用、装入/释放显存资源，并提供场景化启动与模型下载入口。
 
-> 当前处于**开发中**，核心数据结构、扫描解析与持久化层已完成，界面与后端适配正在实现。
+> 当前处于**开发中**：核心、扫描、存储、多后端适配、调用方识别、服务层与 Agent 核心均已实现；**桌面界面（PySide6）与程序入口 `main.py` 尚未提供**，暂不可直接运行。
 
-## 功能规划
+## 功能现状
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| 全局配置 | ✅ 已实现 | 后端地址、扫描阈值、跳过目录、数据目录 |
-| 数据模型与领域异常 | ✅ 已实现 | ModelInfo / RunningModel / AppUser，统一异常分类 |
-| SQLite 持久化 | ✅ 已实现 | 版本化迁移、模型表、设置表、使用统计表、仓储层 |
-| 设置持久化 | ✅ 已实现 | 基于 settings 表的键值配置，带默认值 |
-| 可取消后台任务 | ✅ 已实现 | QThreadPool/QRunnable 协作式取消 + 进度回调 |
-| 模型扫描（GGUF 解析） | ✅ 已实现 | 只读文件头，提取架构、参数量、量化、上下文长度 |
-| 多格式识别（safetensors / pytorch bin / Ollama 库） | 🚧 开发中 | 广嗅探，识别不准的标为未知而不丢弃 |
-| 多后端适配（Ollama / LM Studio / llama.cpp） | 🚧 开发中 | 统一 Provider 接口，Ollama 优先 |
-| 调用方识别（端口反查 + 句柄反查） | 🚧 开发中 | 端口→PID→进程名/路径 |
+| 核心底座 | ✅ 已实现 | 配置、数据模型、领域异常、持久化设置、可取消后台任务、滚动日志 |
+| 硬件快照与装入预检 | ✅ 已实现 | CPU/内存/GPU/Ollama 采集；装入前容量与后端状态粗估（不承诺装入成功） |
+| 子进程监管 | ✅ 已实现 | 仅回收本工具创建的子进程，不使用 shell |
+| SQLite 持久化 | ✅ 已实现 | 版本化迁移、模型/设置/使用统计表、线程本地连接、仓储层 |
+| 模型扫描 | ✅ 已实现 | GGUF 解析、Ollama 库扫描、多格式识别、目录遍历、扫描服务 |
+| 多后端适配 | ✅ 已实现 | Ollama 实装；LM Studio / llama.cpp / vLLM 检测 + 启动器 + 模型操作 |
+| 调用方识别 | ✅ 已实现 | 端口反查、Windows Restart Manager 文件句柄反查、Ollama 日志关联 |
+| 应用服务层 | ✅ 已实现 | 协调扫描/Provider/预检/存储/安全操作；下载拉取、导入导出、格式转换、安全删除 |
+| Agent 核心（无 Qt） | ✅ 已实现 | 场景、会话持久化、改动建议解析、带确认执行的编程工作区 |
 | 桌面界面（PySide6） | 🚧 开发中 | 模型管理 / AI 场景 / 资源下载 / 设置 |
-| 装入与释放、装入前预检 | 🚧 开发中 | 目标设备选择、显存/内存可行性评估 |
+| 程序入口 `main.py` | 🚧 开发中 | 随界面层提供 |
 
 ## 环境要求
 
@@ -51,12 +51,15 @@ python main.py
 ├── LICENSE
 └── app/
     ├── core/               # config 配置 · models 数据结构 · errors 领域异常
-    │                       # settings 持久设置 · tasks 可取消后台任务 · logging_config 日志
-    ├── scanner/            # 扫描与格式识别（gguf.py 已实现）
-    ├── providers/          # 多后端适配
-    ├── inspector/          # 调用方反查
+    │                       # settings 持久设置 · tasks 可取消任务 · logging_config 日志
+    │                       # hardware 硬件快照 · preflight 装入预检 · processes 子进程监管
+    ├── scanner/            # gguf 解析 · ollama 库扫描 · formats 多格式 · walker 遍历 · service 服务
+    ├── providers/          # base 接口 · ollama 实装 · lmstudio / llamacpp / vllm · registry 注册表
+    ├── inspector/          # ports 端口反查 · files 句柄反查 · ollama_logs 日志关联
+    ├── services/           # model_service 协调 · downloads 下载拉取 · transfer 导入导出/转换 · safety 安全删除
+    ├── agent/              # 无 Qt Agent 核心：scenes 场景 · session 会话 · protocol 改动解析 · workspace 工作区
     ├── store/              # db 连接 · migrations 版本迁移 · repositories 仓储
-    └── ui/                 # PySide6 界面
+    └── ui/                 # PySide6 界面（待实现）
 ```
 
 运行期数据（模型库缓存、日志）默认写入 `%APPDATA%\LLMManager`，不会污染仓库目录。
