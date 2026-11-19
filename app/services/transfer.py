@@ -215,7 +215,8 @@ class TransferService:
                 "name": item["name"], "model_id": str(item.get("model_id", "")),
                 "provider": str(item.get("provider", "")), "device": str(item.get("device", "auto")),
                 "context_length": self._nonnegative_int(item.get("context_length", 0), "context_length"),
-                "gpu_layers": int(item.get("gpu_layers", 0)), "threads": int(item.get("threads", 0)),
+                "gpu_layers": self._integer(item.get("gpu_layers", 0), "gpu_layers"),
+                "threads": self._nonnegative_int(item.get("threads", 0), "threads"),
                 "options": options,
             })
         validated_roots = []
@@ -264,6 +265,12 @@ class TransferService:
                 "scan_roots": [{"path": path, "enabled": enabled} for path, enabled in validated_roots],
             },
         )
+
+    @staticmethod
+    def _integer(value: Any, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} 必须是整数")
+        return value
 
     @staticmethod
     def _nonnegative_int(value: Any, name: str) -> int:

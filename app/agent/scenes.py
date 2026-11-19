@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -96,7 +97,7 @@ class SceneRepository:
             with self._lock:
                 self._items[scene.id] = SceneDefinition.from_dict(scene.to_dict())
             return scene
-        now = __import__("time").time()
+        now = time.time()
         payload = json.dumps(scene.to_dict(), ensure_ascii=False, separators=(",", ":"))
         try:
             with self._store.transaction() as conn:

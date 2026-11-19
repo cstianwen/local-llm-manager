@@ -179,7 +179,20 @@ class ModelService:
         hardware: Any = None,
         backend: str = "",
     ) -> PreflightResult:
-        model = self.get_model(model_id)
+        return self._check_preflight(
+            self.get_model(model_id), device=device,
+            context_length=context_length, hardware=hardware, backend=backend,
+        )
+
+    def _check_preflight(
+        self,
+        model: ModelInfo,
+        *,
+        device: str,
+        context_length: int | None,
+        hardware: Any,
+        backend: str,
+    ) -> PreflightResult:
         provider = self._load_provider_name(model, backend)
         context = model.context_length if context_length is None else context_length
         return self.preflight_checker.check(
@@ -210,9 +223,9 @@ class ModelService:
         model = self.get_model(model_id)
         provider_name = self._load_provider_name(model, backend)
         provider = self.registry.get(provider_name)
-        check = self.preflight(
-            model.model_id or model.file_path, device=device,
-            context_length=context_length, hardware=hardware, backend=backend,
+        check = self._check_preflight(
+            model, device=device, context_length=context_length,
+            hardware=hardware, backend=backend,
         )
         if not check.can_attempt and not allow_insufficient:
             self.store.operations.add(
@@ -287,6 +300,26 @@ class ModelService:
         return self.load_model(model_id, **options)
 
     auto_load = ensure_loaded
+
+    def auto_load_task(
+        self,
+        token: Any = None,
+        progress: Callable[[Any], None] | None = None,
+        model_id: str = "",
+        **options: Any,
+    ) -> OperationResult:
+        check_cancelled(token)
+        if progress:
+            progress({"phase": "check_running", "model_id": model_id})
+        result = self.ensure_loaded(model_id, **options)
+        check_cancelled(token)
+        if progress:
+            progress({
+                "phase": "completed", "model_id": model_id,
+                "success": result.success,
+                "already_running": bool(result.data.get("already_running")),
+            })
+        return result
 
     def unload_model(
         self,

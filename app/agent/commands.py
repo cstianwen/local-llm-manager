@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from ..core.errors import ModelManagerError
 from ..core.processes import ManagedProcess, ProcessSupervisor
 from .errors import CommandSecurityError
 
@@ -237,7 +238,7 @@ class CommandCenter:
                 [str(resolved), *plan.args], cwd=plan.cwd or None,
                 provider="agent", purpose=plan.purpose or plan.title, on_log=on_log,
             )
-        except (OSError, ValueError, CommandSecurityError) as exc:
+        except (OSError, ValueError, ModelManagerError, CommandSecurityError) as exc:
             return CommandExecutionResult(plan_id, False, "blocked", f"命令未启动：{exc}")
         return CommandExecutionResult(
             plan_id, True, "started",

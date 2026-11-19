@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import shutil
-import stat
 import tempfile
 import threading
 import time
@@ -593,8 +592,18 @@ class CodingWorkspace:
 
     def preview_model_response(self, text: str) -> tuple[ChangeSet, SuggestionParseResult]:
         parsed = parse_change_suggestions(text)
-        change_set = self.preview_suggestions(parsed.suggestions)
-        change_set.issues.extend(parsed.issues)
+        try:
+            change_set = self.preview_suggestions(parsed.suggestions)
+        except (OSError, ValueError, WorkspaceSecurityError) as exc:
+            # 模型给出的无效指令只形成文本与问题说明，绝不进入待写入集合。
+            parsed.issues.append(str(exc))
+            parsed.suggestions.clear()
+            change_set = ChangeSet(
+                workspace_root=self.root, status="invalid", issues=list(parsed.issues),
+            )
+        change_set.issues.extend(
+            issue for issue in parsed.issues if issue not in change_set.issues
+        )
         return change_set, parsed
 
     def preview_change(
@@ -688,9 +697,14 @@ class CodingWorkspace:
             if valid:
                 self._confirmations.pop(change_id, None)
         if not valid:
-            return self._result(change, False, "blocked", "确认令牌无效、已使用或不存在；未写入")
+            return ApplyResult(
+                change.id, change.path, False, "blocked",
+                "确认令牌无效、已使用或不存在；未写入",
+            )
         if time.time() > expected.expires_at:
-            return self._result(change, False, "blocked", "确认令牌已过期；未写入")
+            return ApplyResult(
+                change.id, change.path, False, "blocked", "确认令牌已过期；未写入",
+            )
         try:
             root = self._require_root()
             supplied = self._key(workspace_root) if workspace_root is not None else self._key(root)

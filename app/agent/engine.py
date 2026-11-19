@@ -8,10 +8,10 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from ..core.errors import BackendOfflineError, ModelManagerError, OperationCancelledError
+from ..core.errors import BackendOfflineError, OperationCancelledError
 from ..core.models import DownloadProgress
 from ..core.settings import Settings
-from ..providers.base import ProviderAPIError
+from ..providers.base import Provider, ProviderAPIError
 from ..providers.ollama import OllamaProvider
 from .commands import CommandCenter, CommandConfirmation, CommandExecutionResult, CommandPlan
 from .errors import AgentError, ModelUnavailableError, SceneNotReadyError
@@ -57,8 +57,10 @@ class AgentEngine:
         scene_registry: SceneRegistry | None = None,
         session_repository: SessionRepository | None = None,
         on_event: EventCallback | None = None,
+        fallback_provider: Provider | None = None,
     ):
         self.provider = provider
+        self.fallback_provider = fallback_provider
         self.store = store
         self.settings = Settings(store) if store is not None else None
         self.workspace = workspace or CodingWorkspace()
@@ -104,15 +106,11 @@ class AgentEngine:
         workspace_root: str = "",
         data: dict[str, Any] | None = None,
     ) -> SceneState:
-        state = self._states.get(scene_id) or SceneState(scene_id=scene_id)
-        state.phase = phase
-        state.model = model
-        state.message = message
-        state.error = error
-        state.provider = provider or {}
-        state.software = software or []
-        state.workspace_root = workspace_root
-        state.data = data or {}
+        state = SceneState(
+            scene_id=scene_id, phase=phase, model=model, message=message, error=error,
+            provider=provider or {}, software=software or [], workspace_root=workspace_root,
+            data=data or {},
+        )
         self._states[scene_id] = state
         self._emit(AgentEvent(
             AgentEventType.STATE, scene_id=scene_id, state=phase.value,
@@ -135,15 +133,36 @@ class AgentEngine:
         selected = (model if model is not None else scene.model).strip()
         self._set_state(scene_id, ScenePhase.CHECKING, model=selected, message="正在检查本机 Ollama")
         try:
-            status = self.provider.detect()
+            try:
+                status = self.provider.detect()
+            except Exception as exc:
+                if self.fallback_provider is not None:
+                    return self._prepare_t4_fallback(
+                        scene, selected, workspace_root, f"Ollama 状态检测不可用：{exc}"
+                    )
+                raise
             provider_data = status.to_dict()
             if not status.running:
+                if self.fallback_provider is not None:
+                    return self._prepare_t4_fallback(
+                        scene, selected, workspace_root,
+                        status.error or status.message or "Ollama 服务未运行",
+                        ollama_status=provider_data,
+                    )
                 return self._set_state(
                     scene_id, ScenePhase.PROVIDER_OFFLINE, model=selected,
                     message=status.message, error=status.error or status.message,
                     provider=provider_data,
                 )
-            models = self.provider.list_models()
+            try:
+                models = self.provider.list_models()
+            except Exception as exc:
+                if self.fallback_provider is not None:
+                    return self._prepare_t4_fallback(
+                        scene, selected, workspace_root, f"Ollama 模型列表不可用：{exc}",
+                        ollama_status=provider_data,
+                    )
+                raise
             available = [item.model_ref or item.file_name for item in models]
             if not selected:
                 return self._set_state(
@@ -210,6 +229,124 @@ class AgentEngine:
                 scene_id, ScenePhase.ERROR, model=selected,
                 message="场景检查失败，未进入工作窗或启动软件。", error=str(exc),
             )
+
+    def _prepare_t4_fallback(
+        self,
+        scene: SceneDefinition,
+        requested_model: str,
+        workspace_root: str | os.PathLike[str] | None,
+        fallback_reason: str,
+        *,
+        ollama_status: dict[str, Any] | None = None,
+    ) -> SceneState:
+        """只检测显式提供的 T4；任何失败都不得转变为自动启动。"""
+        fallback = self.fallback_provider
+        if fallback is None:
+            raise BackendOfflineError(fallback_reason)
+        reason = str(fallback_reason).strip() or "Ollama 不可用"
+        note = f"active_provider='t4'；fallback_reason={reason}"
+        provider_data: dict[str, Any] = {
+            "provider": "t4", "active_provider": "t4", "fallback_reason": reason,
+        }
+        data: dict[str, Any] = {
+            "active_provider": "t4",
+            "fallback": True,
+            "fallback_reason": reason,
+            "requested_model": requested_model,
+            "ollama_status": ollama_status or {},
+        }
+        try:
+            status = fallback.detect()
+            provider_data = {**status.to_dict(), "active_provider": "t4", "fallback_reason": reason}
+        except Exception as exc:
+            message = (
+                f"Ollama 不可用，T4 状态检测也失败：{exc}。请手动启动 T4 后重试；"
+                f"本工具不会自动执行脚本。{note}"
+            )
+            return self._set_state(
+                scene.id, ScenePhase.PROVIDER_OFFLINE, model=requested_model,
+                message=message, error=str(exc), provider=provider_data,
+                data={
+                    **data, "action": "NEEDS_START", "code": "NEEDS_START",
+                    "needs_start": True, "manual_start_required": True,
+                    "start_script": getattr(fallback, "start_script", ""),
+                },
+            )
+        if not status.running:
+            manual = (
+                f"请由用户手动调用 T4Provider.start_service 或执行 "
+                f"{getattr(fallback, 'start_script', '配置的 T4 启动脚本')}；本工具不会自动启动。"
+            )
+            message = f"Ollama 不可用，T4 未就绪。{manual}{note}"
+            return self._set_state(
+                scene.id, ScenePhase.PROVIDER_OFFLINE, model=requested_model,
+                message=message, error=status.error or status.message,
+                provider=provider_data,
+                data={
+                    **data, "action": "NEEDS_START", "code": "NEEDS_START",
+                    "needs_start": True, "manual_start_required": True,
+                    "start_script": getattr(fallback, "start_script", ""),
+                    "t4_status": status.to_dict(),
+                },
+            )
+        try:
+            models = fallback.list_models()
+            if not models:
+                raise ProviderAPIError("T4 健康服务没有报告固定模型", provider="t4")
+            active_model = models[0].model_ref or models[0].file_name
+            if not active_model:
+                raise ProviderAPIError("T4 固定模型名称为空", provider="t4")
+        except Exception as exc:
+            return self._set_state(
+                scene.id, ScenePhase.ERROR, model=requested_model,
+                message=f"T4 已健康，但固定模型映射失败；{note}",
+                error=str(exc), provider=provider_data, data=data,
+            )
+        data.update({
+            "active_model": active_model,
+            "available_models": [item.model_ref or item.file_name for item in models],
+        })
+
+        software: list[SoftwareStatus] = []
+        for requirement in scene.software:
+            executable = configured_executable(requirement, self.settings)
+            installed = bool(executable)
+            software.append(SoftwareStatus(
+                id=requirement.id, name=requirement.name, installed=installed,
+                executable=executable, download_url=requirement.download_url,
+                purpose=requirement.purpose,
+                message="已验证配置的本地程序。" if installed else "未配置或找不到本地配套软件；未自动下载或启动。",
+            ))
+        if any(not item.installed for item in software):
+            return self._set_state(
+                scene.id, ScenePhase.NEEDS_SOFTWARE, model=active_model,
+                message=f"Ollama 不可用，已回退 T4；配套软件不可用，内置对话仍可使用。{note}",
+                provider=provider_data, software=software,
+                data={**data, "software_required": True, "chat_available": True},
+            )
+        if scene.entry_point == EntryPoint.WORKSPACE:
+            if workspace_root is not None:
+                selected_root = self.workspace.select_root(workspace_root)
+            else:
+                selected_root = self.workspace.root
+            if not selected_root:
+                return self._set_state(
+                    scene.id, ScenePhase.NEEDS_WORKSPACE, model=active_model,
+                    message=f"已回退 T4；AI 编程/工程维护仍需显式选择工作区。{note}",
+                    provider=provider_data, software=software, data=data,
+                )
+        else:
+            selected_root = self.workspace.root if workspace_root is not None else ""
+        return self._set_state(
+            scene.id, ScenePhase.READY, model=active_model,
+            message=f"Ollama 不可用，已使用健康的 T4 固定服务。{note}",
+            provider=provider_data, software=software, workspace_root=selected_root,
+            data={
+                **data,
+                "entry_point": scene.entry_point.value,
+                "requires_software_start": scene.entry_point == EntryPoint.COMPANION_SOFTWARE,
+            },
+        )
 
     def prepare_session(self, session_id: str) -> SceneState:
         session = self.sessions.require(session_id)
@@ -408,6 +545,9 @@ class AgentEngine:
             workspace_root=session.workspace_root or None,
         )
         if state.phase == ScenePhase.PROVIDER_OFFLINE:
+            if state.data.get("active_provider") == "t4":
+                # 回退离线必须保留 NEEDS_START 对应的中文手动启动说明，而非只暴露连接错误。
+                raise BackendOfflineError(state.message or state.error)
             raise BackendOfflineError(state.error or state.message)
         if state.phase in {ScenePhase.NEEDS_MODEL, ScenePhase.NEEDS_DOWNLOAD}:
             raise ModelUnavailableError(state.message)
@@ -442,64 +582,142 @@ class AgentEngine:
         session.status = "streaming"
         session.updated_at = time.time()
         self.sessions.save(session)
-        yield self._emit(AgentEvent(
-            AgentEventType.USER_MESSAGE, session_id=session_id, scene_id=session.scene_id,
-            message_id=user.id, data={"message": user.to_dict()},
-        ))
-        yield self._emit(AgentEvent(
-            AgentEventType.ASSISTANT_STARTED, session_id=session_id, scene_id=session.scene_id,
-            state=ScenePhase.STREAMING.value, message_id=assistant.id,
-            data={"message": assistant.to_dict()},
-        ))
         done_event: dict[str, Any] | None = None
+        readiness: SceneState | None = None
         try:
-            self._check_chat_ready(session)
+            yield self._emit(AgentEvent(
+                AgentEventType.USER_MESSAGE, session_id=session_id, scene_id=session.scene_id,
+                message_id=user.id, data={"message": user.to_dict()},
+            ))
+            yield self._emit(AgentEvent(
+                AgentEventType.ASSISTANT_STARTED, session_id=session_id, scene_id=session.scene_id,
+                state=ScenePhase.STREAMING.value, message_id=assistant.id,
+                data={"message": assistant.to_dict()},
+            ))
+            readiness = self._check_chat_ready(session)
+            active_provider = str(readiness.data.get("active_provider") or "ollama")
+            active_backend = self.fallback_provider if active_provider == "t4" else self.provider
+            if active_backend is None:
+                raise BackendOfflineError("T4 回退 Provider 未配置")
+            active_model = readiness.model if active_provider == "t4" else session.model
+            if active_provider == "t4":
+                assistant.model = active_model
+                assistant.metadata["active_provider"] = "t4"
+                assistant.metadata["fallback_reason"] = readiness.data.get("fallback_reason", "")
             self._set_state(
-                session.scene_id, ScenePhase.STREAMING, model=session.model,
-                message="正在接收本机 Ollama 流式回复", workspace_root=session.workspace_root,
+                session.scene_id, ScenePhase.STREAMING, model=active_model,
+                message=(
+                    "正在接收本机 Ollama 流式回复" if active_provider == "ollama" else
+                    f"正在接收 T4 回退回复；active_provider='t4'；"
+                    f"fallback_reason={readiness.data.get('fallback_reason', '')}"
+                ),
+                provider=readiness.provider, software=readiness.software,
+                workspace_root=session.workspace_root, data=readiness.data,
             )
             history = self._history(session, assistant.id)
-            if use_generate:
-                transcript = "\n\n".join(f"{item['role']}: {item['content']}" for item in history)
-                stream = self.provider.generate(
-                    session.model, transcript, options=options, keep_alive=keep_alive,
-                    cancel_token=token,
-                )
-            else:
-                stream = self.provider.chat(
-                    session.model, history, options=options, keep_alive=keep_alive,
-                    cancel_token=token,
-                )
-            for event in stream:
-                token.raise_if_cancelled()
-                if use_generate:
-                    delta = event.get("response", "")
-                else:
-                    message = event.get("message", {})
-                    delta = message.get("content", "") if isinstance(message, dict) else ""
-                if not isinstance(delta, str):
-                    raise ProviderAPIError("Ollama 流式 content/response 不是字符串", provider="ollama")
-                if delta:
-                    assistant.content += delta
-                    yield self._emit(AgentEvent(
-                        AgentEventType.TOKEN, session_id=session_id, scene_id=session.scene_id,
-                        message_id=assistant.id, delta=delta,
-                    ))
-                if event.get("done") is True:
-                    done_event = event
-            token.raise_if_cancelled()
-            if done_event is None:
-                raise ProviderAPIError(
-                    "Ollama 流在未收到 done=true 前结束，不能视为完整回复", provider="ollama",
-                )
+            transcript = "\n\n".join(f"{item['role']}: {item['content']}" for item in history)
+            while True:
+                try:
+                    if use_generate:
+                        stream = active_backend.generate(
+                            active_model, transcript, options=options, keep_alive=keep_alive,
+                            cancel_token=token,
+                        )
+                    else:
+                        stream = active_backend.chat(
+                            active_model, history, options=options, keep_alive=keep_alive,
+                            cancel_token=token,
+                        )
+                    for event in stream:
+                        token.raise_if_cancelled()
+                        if use_generate:
+                            delta = event.get("response", "")
+                        else:
+                            message = event.get("message", {})
+                            delta = message.get("content", "") if isinstance(message, dict) else ""
+                        if not isinstance(delta, str):
+                            raise ProviderAPIError(
+                                f"{'Ollama' if active_provider == 'ollama' else 'T4'} 流式 content/response 不是字符串",
+                                provider=active_provider,
+                            )
+                        if delta:
+                            assistant.content += delta
+                            yield self._emit(AgentEvent(
+                                AgentEventType.TOKEN, session_id=session_id, scene_id=session.scene_id,
+                                message_id=assistant.id, delta=delta,
+                            ))
+                        if event.get("done") is True:
+                            done_event = event
+                    token.raise_if_cancelled()
+                    if done_event is None:
+                        raise ProviderAPIError(
+                            f"{'Ollama' if active_provider == 'ollama' else 'T4'} 流在未收到 done=true 前结束，不能视为完整回复",
+                            provider=active_provider,
+                        )
+                    break
+                except (BackendOfflineError, ProviderAPIError) as exc:
+                    # 已产生任何文本后不重试，避免把两个后端的答案拼接成伪成功回复。
+                    if (
+                        active_provider != "ollama" or assistant.content
+                        or self.fallback_provider is None
+                    ):
+                        raise
+                    reason = f"Ollama 推理不可用：{exc}"
+                    fallback_state = self._prepare_t4_fallback(
+                        self.scenes.get(session.scene_id), session.model,
+                        session.workspace_root or None, reason,
+                        ollama_status=readiness.provider,
+                    )
+                    readiness = fallback_state
+                    if fallback_state.phase not in {ScenePhase.READY, ScenePhase.NEEDS_SOFTWARE}:
+                        raise BackendOfflineError(
+                            fallback_state.error or fallback_state.message
+                        ) from exc
+                    active_provider = "t4"
+                    active_backend = self.fallback_provider
+                    active_model = fallback_state.model
+                    done_event = None
+                    assistant.model = active_model
+                    assistant.metadata["active_provider"] = "t4"
+                    assistant.metadata["fallback_reason"] = reason
+                    self._set_state(
+                        session.scene_id, ScenePhase.STREAMING, model=active_model,
+                        message=(
+                            f"Ollama 流不可用，正在接收 T4 回退回复；active_provider='t4'；"
+                            f"fallback_reason={reason}"
+                        ),
+                        provider=readiness.provider, software=readiness.software,
+                        workspace_root=session.workspace_root, data=readiness.data,
+                    )
             assistant.status = "completed"
             assistant.metadata["done"] = done_event
             session.status = "idle"
             session.updated_at = time.time()
             self.sessions.save(session)
+            final_phase = (
+                ScenePhase.NEEDS_SOFTWARE
+                if readiness is not None and readiness.phase == ScenePhase.NEEDS_SOFTWARE
+                else ScenePhase.READY
+            )
+            if active_provider == "t4":
+                final_message = (
+                    f"T4 回退回复已完成；active_provider='t4'；"
+                    f"fallback_reason={readiness.data.get('fallback_reason', '')}"
+                )
+                if final_phase == ScenePhase.NEEDS_SOFTWARE:
+                    final_message += "；配套软件仍未就绪"
+            else:
+                final_message = (
+                    "本机回复已完成；配套软件仍未就绪。" if final_phase == ScenePhase.NEEDS_SOFTWARE
+                    else "本机回复已完成"
+                )
             self._set_state(
-                session.scene_id, ScenePhase.READY, model=session.model,
-                message="本机回复已完成", workspace_root=session.workspace_root,
+                session.scene_id, final_phase, model=active_model,
+                message=final_message,
+                provider=readiness.provider if readiness else {},
+                software=readiness.software if readiness else [],
+                workspace_root=session.workspace_root,
+                data=readiness.data if readiness else {},
             )
             yield self._emit(AgentEvent(
                 AgentEventType.ASSISTANT_COMPLETED, session_id=session_id, scene_id=session.scene_id,
@@ -525,6 +743,20 @@ class AgentEngine:
             session.status = "error"
             session.updated_at = time.time()
             self.sessions.save(session)
+            if readiness is not None:
+                is_t4 = readiness.data.get("active_provider") == "t4"
+                self._set_state(
+                    session.scene_id, ScenePhase.ERROR,
+                    model=readiness.model if is_t4 else session.model,
+                    message=(
+                        f"T4 回退回复流失败；active_provider='t4'；"
+                        f"fallback_reason={readiness.data.get('fallback_reason', '')}"
+                        if is_t4 else "本机回复流失败，未标记为成功。"
+                    ),
+                    error=str(exc), provider=readiness.provider, software=readiness.software,
+                    workspace_root=session.workspace_root,
+                    data=readiness.data if is_t4 else {},
+                )
             yield self._emit(AgentEvent(
                 AgentEventType.ERROR, session_id=session_id, scene_id=session.scene_id,
                 message_id=assistant.id, error=str(exc), data={"message": assistant.to_dict()},
@@ -540,6 +772,11 @@ class AgentEngine:
                 session.status = "cancelled"
                 session.updated_at = time.time()
                 self.sessions.save(session)
+                self._set_state(
+                    session.scene_id, ScenePhase.CANCELLED, model=session.model,
+                    message="回复流已由调用方提前关闭；仅保存真实部分内容。",
+                    workspace_root=session.workspace_root,
+                )
                 self._emit(AgentEvent(
                     AgentEventType.CANCELLED, session_id=session_id, scene_id=session.scene_id,
                     state=ScenePhase.CANCELLED.value, message_id=assistant.id,

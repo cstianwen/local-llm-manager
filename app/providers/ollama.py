@@ -231,12 +231,22 @@ class OllamaProvider(Provider):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("模型名称不能为空")
 
-    def _set_keep_alive(self, model: str, keep_alive: Any) -> OperationResult:
+    def _set_keep_alive(
+        self,
+        model: str,
+        keep_alive: Any,
+        options: dict[str, Any] | None = None,
+    ) -> OperationResult:
         self._require_model(model)
+        payload: dict[str, Any] = {
+            "model": model, "prompt": "", "keep_alive": keep_alive, "stream": False,
+        }
+        if options:
+            payload["options"] = dict(options)
         response = self._client.request_json(
             "POST",
             "/api/generate",
-            {"model": model, "prompt": "", "keep_alive": keep_alive, "stream": False},
+            payload,
             timeout=max(self._client.timeout, 120.0),
         )
         if not isinstance(response, dict):
@@ -250,7 +260,7 @@ class OllamaProvider(Provider):
         return OperationResult(True, "Ollama 已确认 keep_alive 请求。", data=response)
 
     def load_model(self, model: str, *, keep_alive: Any = "5m", **options: Any) -> OperationResult:
-        result = self._set_keep_alive(model, keep_alive)
+        result = self._set_keep_alive(model, keep_alive, dict(options))
         result.message = f"模型 {model} 的装入请求已由 Ollama 确认，keep_alive={keep_alive!r}。"
         return result
 

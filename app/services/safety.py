@@ -11,11 +11,12 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..core.config import app_data_dir, ollama_models_root
 from ..core.errors import ModelManagerError
 from ..core.models import ModelInfo, OperationResult
+from ..providers.base import check_cancelled
 from ..store.db import ModelStore
 
 _INDEX_SCHEMA = "local-model-manager/quarantine"
@@ -232,8 +233,19 @@ class QuarantineService:
         *,
         confirmation: bool = False,
     ) -> OperationResult:
+        model = self._model(model_id)
         if confirmation is not True:
-            return _confirmation_required("移入隔离区", {"model_id": model_id, "expected_path": os.fspath(expected_path) if expected_path else ""})
+            sources = self._sources(model)
+            files = [
+                {"path": str(source), "size_bytes": source.stat().st_size}
+                for source in sources
+            ]
+            return _confirmation_required("移入隔离区", {
+                "model_id": model.model_id,
+                "expected_path": model.file_path,
+                "files": files,
+                "size_bytes": sum(item["size_bytes"] for item in files),
+            })
         if expected_path is None:
             raise ValueError("必须显式传入与数据库记录一致的 expected_path")
         with self._lock:
@@ -322,6 +334,10 @@ class QuarantineService:
                 validate_unprotected_file(target, quarantine_root=self.root) if target.exists() else None
                 if target.parent == target or any(inside_path(target, item) for item in _system_directories()):
                     raise ValueError(f"禁止恢复到系统目录或根目录：{target}")
+                # 隔离后原父目录可能被替换为 junction；不能沿着重解析点写到其他位置。
+                for ancestor in (target.parent, *target.parent.parents):
+                    if ancestor.exists() and _is_reparse(ancestor):
+                        raise ValueError(f"恢复路径的父目录含符号链接或重解析点：{ancestor}")
                 if _ollama_shared_path(target, model):
                     raise ValueError("禁止把隔离文件恢复为 Ollama manifest/blob")
                 if os.path.lexists(target):
@@ -513,6 +529,24 @@ class DiskMaintenanceService:
             "磁盘瘦身完成；未删除任何模型原路径。" if not errors else "磁盘瘦身部分完成，请查看失败原因。",
             data={"freed_bytes": freed, "errors": errors}, error="partial_failure" if errors else "",
         )
+
+    def clean_task(
+        self,
+        token: Any = None,
+        progress: Callable[[Any], None] | None = None,
+        **options: Any,
+    ) -> OperationResult:
+        check_cancelled(token)
+        if progress:
+            progress({"phase": "plan"})
+        result = self.clean(**options)
+        check_cancelled(token)
+        if progress:
+            progress({
+                "phase": "completed", "success": result.success,
+                "freed_bytes": result.data.get("freed_bytes", 0),
+            })
+        return result
 
 
 SafeDeleteService = QuarantineService

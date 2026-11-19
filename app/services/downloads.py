@@ -253,11 +253,17 @@ class DownloadService:
         progress_id = model_ref or str(self._field(resource, "id", "") or resource_id)
         try:
             check_cancelled(token)
+            # job_id 只保证本次数据库中的唯一性；旧库删除后可能留下同名临时文件，绝不能追加。
+            with part.open("xb"):
+                pass
             request = urllib.request.Request(url, headers={
                 "Accept": "application/octet-stream", "User-Agent": "LocalModelManager/1.0",
             }, method="GET")
             response = self._opener(request, timeout=self.timeout)
             with response:
+                status_code = response.getcode()
+                if status_code != 200:
+                    raise ModelManagerError(f"下载需要完整 HTTP 200 响应，实际为 {status_code}；未接受部分内容")
                 final_url = str(getattr(response, "url", "") or response.geturl() or url)
                 self._validate_https(final_url)
                 content_type = str(response.headers.get("Content-Type", "") or "").casefold()

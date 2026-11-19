@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!本地模型管家.spec
 .venv/
 venv/
 env/
@@ -26,3 +27,6 @@ logs/
 Thumbs.db
 desktop.ini
 .trae/
+
+# ---- 本地备份 ----
+assets_旧图标备份_*/

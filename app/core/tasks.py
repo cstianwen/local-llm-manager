@@ -1,11 +1,18 @@
-"""基于 Qt 线程池的协作式可取消后台任务。"""
+"""基于 Qt 线程池的协作式可取消后台任务。
+
+生命周期约定（修复 Qt6Core 0xc0000005 二次释放）：
+- ``Task`` 关闭 Qt 的 autoDelete，C++ 对象由 Python 侧持有；
+- 任务结束后只在主线程移除字典引用，并把对象放进有界 retired 列表，
+  等线程池确认 run() 返回后才由 Python 释放，避免 Qt 与 Python 同时 delete。
+"""
 from __future__ import annotations
 
 import threading
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 
 from .errors import OperationCancelledError
 
@@ -49,6 +56,8 @@ class Task(QRunnable):
         on_finish: Callable[[str, Task], None],
     ):
         super().__init__()
+        # Qt 不再在 run() 返回后自动释放；释放权交给 Python（主线程）。
+        self.setAutoDelete(False)
         self.key = key
         self.token = CancellationToken()
         self.signals = TaskSignals()
@@ -74,20 +83,30 @@ class Task(QRunnable):
             self.signals.error.emit(exc)
         finally:
             self.signals.finished.emit()
+            # 只投递"已完成"事件，不在这里改 Python 容器或删除对象。
             self._on_finish(self.key, self)
 
 
-class TaskManager:
+class TaskManager(QObject):
+    """任务去重、取消与主线程回收。"""
+
+    _finished = Signal(object)
+
     def __init__(
         self,
         max_threads: int = 0,
         pool: QThreadPool | None = None,
+        parent: QObject | None = None,
     ):
+        super().__init__(parent)
         self._pool = pool or QThreadPool()
         if max_threads > 0:
             self._pool.setMaxThreadCount(max_threads)
         self._tasks: dict[str, Task] = {}
+        self._retired: deque[Task] = deque(maxlen=64)
         self._lock = threading.RLock()
+        # 显式排队：worker 线程 emit、主线程移除引用。
+        self._finished.connect(self._task_finished, Qt.ConnectionType.QueuedConnection)
 
     @property
     def active_keys(self) -> tuple[str, ...]:
@@ -105,7 +124,7 @@ class TaskManager:
         with self._lock:
             if key in self._tasks:
                 return None
-            task = Task(key, worker, args, kwargs, self._task_finished)
+            task = Task(key, worker, args, kwargs, self._notify_finished)
             self._tasks[key] = task
         self._pool.start(task)
         return task
@@ -130,7 +149,14 @@ class TaskManager:
             return True
         return self._pool.waitForDone(timeout_ms)
 
-    def _task_finished(self, key: str, task: Task) -> None:
+    def _notify_finished(self, _key: str, task: Task) -> None:
+        """在工作线程调用，只投递信号。"""
+        self._finished.emit(task)
+
+    @Slot(object)
+    def _task_finished(self, task: Task) -> None:
+        """主线程执行：移出活动表并暂存到 retired，稍后由 Python 释放。"""
         with self._lock:
-            if self._tasks.get(key) is task:
-                del self._tasks[key]
+            if self._tasks.get(task.key) is task:
+                del self._tasks[task.key]
+            self._retired.append(task)

@@ -9,6 +9,12 @@ from .base import Capability, CapabilityState, Provider, ProviderStatus
 from .llamacpp import LlamaCppProvider
 from .lmstudio import LMStudioProvider
 from .ollama import OllamaProvider
+from .t4 import (
+    DEFAULT_T4_START_SCRIPT,
+    DEFAULT_T4_STOP_SCRIPT,
+    DEFAULT_T4_URL,
+    T4Provider,
+)
 from .vllm import VLLMProvider
 
 
@@ -99,14 +105,23 @@ class ProviderRegistry:
 def create_default_registry(
     *, supervisor: ProcessSupervisor | None = None,
     ollama_url: str = "http://127.0.0.1:11434",
+    t4_url: str = DEFAULT_T4_URL,
+    t4_start_script: str = DEFAULT_T4_START_SCRIPT,
+    t4_stop_script: str = DEFAULT_T4_STOP_SCRIPT,
 ) -> ProviderRegistry:
-    """创建四个内置 Provider；仅检测，不安装也不启动外部服务。"""
+    """创建内置 Provider；Ollama 保持第一默认，注册本身不启动外部服务。"""
     owned_supervisor = supervisor or ProcessSupervisor()
     registry = ProviderRegistry([
         OllamaProvider(ollama_url),
         LlamaCppProvider(supervisor=owned_supervisor),
         LMStudioProvider(supervisor=owned_supervisor),
         VLLMProvider(supervisor=owned_supervisor),
+        T4Provider(
+            t4_url,
+            start_script=t4_start_script,
+            stop_script=t4_stop_script,
+            supervisor=owned_supervisor,
+        ),
     ])
     if supervisor is None:
         # 默认注册表拥有共享监管器，避免各 Provider 重复回收同一进程。
